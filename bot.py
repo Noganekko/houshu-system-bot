@@ -5,37 +5,22 @@ import datetime
 import os
 from flask import Flask
 
-# =========================
-# 環境変数
-# =========================
-TOKEN = os.getenv("TOKEN")  # Renderで設定済み
+TOKEN = os.getenv("TOKEN")  # Renderに設定したBotトークン
 
-# =========================
-# Discord セットアップ
-# =========================
 intents = discord.Intents.default()
 intents.members = True
 intents.message_content = True
+
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
 # =========================
-# Flask サーバー（Render用）
-# =========================
-app = Flask(__name__)
-
-@app.route("/")
-def home():
-    return "Houshu System Bot is running!"
-
-# =========================
 # データベース初期化
 # =========================
-DB_NAME = "houshu.db"
-conn = sqlite3.connect(DB_NAME)
+
+conn = sqlite3.connect("houshu.db")
 c = conn.cursor()
 
-# ユーザー情報
 c.execute("""
 CREATE TABLE IF NOT EXISTS users (
     user_id TEXT PRIMARY KEY,
@@ -44,7 +29,6 @@ CREATE TABLE IF NOT EXISTS users (
 )
 """)
 
-# ポイント情報
 c.execute("""
 CREATE TABLE IF NOT EXISTS points (
     user_id TEXT PRIMARY KEY,
@@ -54,7 +38,6 @@ CREATE TABLE IF NOT EXISTS points (
 )
 """)
 
-# 制作報告
 c.execute("""
 CREATE TABLE IF NOT EXISTS reports (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -64,10 +47,20 @@ CREATE TABLE IF NOT EXISTS reports (
     month TEXT
 )
 """)
+
 conn.commit()
 
 # =========================
-# 起動時処理
+# Flaskサーバー
+# =========================
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "Houshu Bot is running!"
+
+# =========================
+# Bot起動
 # =========================
 @client.event
 async def on_ready():
@@ -75,24 +68,27 @@ async def on_ready():
     print("Houshu System Bot 起動")
 
 # =========================
-# 制作報告コマンド
+# 制作報告
 # =========================
 @tree.command(name="report", description="制作報告を提出")
 async def report(interaction: discord.Interaction, pt: int):
     user_id = str(interaction.user.id)
     month = datetime.datetime.now().strftime("%Y-%m")
+
     c.execute("INSERT INTO reports (user_id, pt, status, month) VALUES (?, ?, ?, ?)",
               (user_id, pt, "pending", month))
     conn.commit()
     await interaction.response.send_message("報告を受理しました（pending）")
 
 # =========================
-# 承認コマンド
+# 承認コマンド（管理者専用）
 # =========================
-@tree.command(name="approve", description="報告を承認")
+ADMIN_ROLE = "管理"
+
+@tree.command(name="approve", description="報告を承認（管理者専用）")
 async def approve(interaction: discord.Interaction, report_id: int):
-    # 管理者チェック
-    if "管理" not in [role.name for role in interaction.user.roles]:
+    member = interaction.user
+    if ADMIN_ROLE not in [role.name for role in member.roles]:
         await interaction.response.send_message("管理者専用コマンドです")
         return
 
@@ -101,36 +97,18 @@ async def approve(interaction: discord.Interaction, report_id: int):
     if not data:
         await interaction.response.send_message("報告が存在しません")
         return
+
     user_id, pt, status = data
     if status != "pending":
         await interaction.response.send_message("既に処理済みです")
         return
 
+    # 承認処理
     c.execute("UPDATE reports SET status='approved' WHERE id=?", (report_id,))
     c.execute("INSERT OR IGNORE INTO points (user_id) VALUES (?)", (user_id,))
     c.execute("UPDATE points SET eval_pt = eval_pt + ? WHERE user_id=?", (pt, user_id))
     conn.commit()
     await interaction.response.send_message("承認しました")
-
-# =========================
-# 却下コマンド
-# =========================
-@tree.command(name="reject", description="報告を却下")
-async def reject(interaction: discord.Interaction, report_id: int):
-    if "管理" not in [role.name for role in interaction.user.roles]:
-        await interaction.response.send_message("管理者専用コマンドです")
-        return
-    c.execute("SELECT status FROM reports WHERE id=?", (report_id,))
-    data = c.fetchone()
-    if not data:
-        await interaction.response.send_message("報告が存在しません")
-        return
-    if data[0] != "pending":
-        await interaction.response.send_message("既に処理済みです")
-        return
-    c.execute("UPDATE reports SET status='rejected' WHERE id=?", (report_id,))
-    conn.commit()
-    await interaction.response.send_message("却下しました")
 
 # =========================
 # 自分のポイント確認
@@ -151,120 +129,39 @@ async def mypoint(interaction: discord.Interaction):
 # =========================
 # 月次決算コマンド（管理者専用）
 # =========================
-@tree.command(name="monthly_close", description="月次決算を実行")
-async def monthly_close(interaction: discord.Interaction):
-    if "管理" not in [role.name for role in interaction.user.roles]:
+@tree.command(name="month_end", description="月次決算処理（管理者専用）")
+async def month_end(interaction: discord.Interaction):
+    member = interaction.user
+    if ADMIN_ROLE not in [role.name for role in member.roles]:
         await interaction.response.send_message("管理者専用コマンドです")
         return
 
     month = datetime.datetime.now().strftime("%Y-%m")
+    c.execute("SELECT user_id, eval_pt, carry_pt FROM points")
+    all_points = c.fetchall()
 
-    c.execute("SELECT user_id, eval_pt, carry_pt, save_pt FROM points")
-    all_users = c.fetchall()
-
-    for user_id, eval_pt, carry_pt, save_pt in all_users:
-        # ノルマ達成判定（20Pt）
-        used_eval = min(eval_pt + carry_pt, 20)
-        remaining = (eval_pt + carry_pt) - used_eval
-
-        # 未達カウント更新
-        c.execute("SELECT missed_count, exempt FROM users WHERE user_id=?", (user_id,))
-        data = c.fetchone()
-        if data:
-            missed_count, exempt = data
+    for user_id, eval_pt, carry_pt in all_points:
+        total = eval_pt + carry_pt
+        # ノルマ 20Pt 消費
+        if total >= 20:
+            new_carry = total - 20
+            missed = 0
         else:
-            missed_count, exempt = 0, 0
-            c.execute("INSERT INTO users (user_id) VALUES (?)", (user_id,))
-
-        if exempt == 0:
-            if used_eval < 20:
-                missed_count += 1
-            else:
-                missed_count = 0
-
-        # ポイント処理
-        carry_pt = remaining  # 繰越Pt
-        save_pt += max(eval_pt + carry_pt - 20, 0)  # 貯蓄Pt加算
-
-        c.execute("UPDATE points SET eval_pt=0, carry_pt=?, save_pt=? WHERE user_id=?",
-                  (carry_pt, save_pt, user_id))
-        c.execute("UPDATE users SET missed_count=? WHERE user_id=?", (missed_count, user_id))
-
-    conn.commit()
-    await interaction.response.send_message("月次決算を実行しました")
-
-# =========================
-# Bot起動
-# =========================
-if __name__ == "__main__":
-    from threading import Thread
-    def run_flask():
-        app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
-
-    Thread(target=run_flask).start()
-    # =========================
-# 月次決算処理コマンド（管理者専用）
-# =========================
-
-@tree.command(name="month_end", description="月次決算を実行（管理者専用）")
-async def month_end(interaction: discord.Interaction):
-    # 管理者ロール確認
-    admin_role = discord.utils.get(interaction.user.roles, name="管理")
-    if not admin_role:
-        await interaction.response.send_message("あなたは管理者ではありません")
-        return
-
-    month = datetime.datetime.now().strftime("%Y-%m")
-
-    # 全ユーザー処理
-    c.execute("SELECT user_id, eval_pt, carry_pt, save_pt FROM points")
-    users = c.fetchall()
-
-    report_lines = []
-
-    for user_id, eval_pt, carry_pt, save_pt in users:
-        # ノルマ消費
-        remaining = eval_pt - 20
-        if remaining < 0:
-            # carry_pt で補填
-            if carry_pt + eval_pt >= 20:
-                remaining = 0
-                carry_pt = carry_pt + eval_pt - 20
-                eval_pt = 20
-            else:
-                # 未達
-                eval_pt += carry_pt
-                carry_pt = 0
-        else:
-            carry_pt = remaining
-
-        # 未達カウント更新
-        c.execute("SELECT missed_count, exempt FROM users WHERE user_id=?", (user_id,))
-        user_data = c.fetchone()
-        if user_data:
-            missed_count, exempt = user_data
-        else:
-            missed_count, exempt = 0, 0
+            new_carry = 0
+            missed = 1
+        c.execute("UPDATE points SET eval_pt=0, carry_pt=? WHERE user_id=?", (new_carry, user_id))
+        if missed:
             c.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
-
-        if exempt == 0:
-            if eval_pt < 20:
-                missed_count += 1
-            else:
-                missed_count = 0  # 達成月があればリセット
-
-        # データ更新
-        c.execute("UPDATE points SET eval_pt=0, carry_pt=?, save_pt=? WHERE user_id=?",
-                  (carry_pt, save_pt, user_id))
-        c.execute("UPDATE users SET missed_count=? WHERE user_id=?", (missed_count, user_id))
-
-        report_lines.append(f"<@{user_id}> : 未達連続 {missed_count} 回, 繰越 Pt {carry_pt}")
-
+            c.execute("UPDATE users SET missed_count = missed_count + 1 WHERE user_id=?", (user_id,))
     conn.commit()
+    await interaction.response.send_message("月次決算処理を完了しました")
 
-    # 結果を返信
-    await interaction.response.send_message(
-        "月次決算処理完了\n" + "\n".join(report_lines)
-    )
+# =========================
+# Render用 Flaskと同時起動
+# =========================
+from threading import Thread
+def run_flask():
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+Thread(target=run_flask).start()
 
-    client.run(TOKEN)
+client.run(TOKEN)
