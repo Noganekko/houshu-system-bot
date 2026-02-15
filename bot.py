@@ -202,4 +202,69 @@ if __name__ == "__main__":
         app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
 
     Thread(target=run_flask).start()
+    # =========================
+# 月次決算処理コマンド（管理者専用）
+# =========================
+
+@tree.command(name="month_end", description="月次決算を実行（管理者専用）")
+async def month_end(interaction: discord.Interaction):
+    # 管理者ロール確認
+    admin_role = discord.utils.get(interaction.user.roles, name="管理")
+    if not admin_role:
+        await interaction.response.send_message("あなたは管理者ではありません")
+        return
+
+    month = datetime.datetime.now().strftime("%Y-%m")
+
+    # 全ユーザー処理
+    c.execute("SELECT user_id, eval_pt, carry_pt, save_pt FROM points")
+    users = c.fetchall()
+
+    report_lines = []
+
+    for user_id, eval_pt, carry_pt, save_pt in users:
+        # ノルマ消費
+        remaining = eval_pt - 20
+        if remaining < 0:
+            # carry_pt で補填
+            if carry_pt + eval_pt >= 20:
+                remaining = 0
+                carry_pt = carry_pt + eval_pt - 20
+                eval_pt = 20
+            else:
+                # 未達
+                eval_pt += carry_pt
+                carry_pt = 0
+        else:
+            carry_pt = remaining
+
+        # 未達カウント更新
+        c.execute("SELECT missed_count, exempt FROM users WHERE user_id=?", (user_id,))
+        user_data = c.fetchone()
+        if user_data:
+            missed_count, exempt = user_data
+        else:
+            missed_count, exempt = 0, 0
+            c.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
+
+        if exempt == 0:
+            if eval_pt < 20:
+                missed_count += 1
+            else:
+                missed_count = 0  # 達成月があればリセット
+
+        # データ更新
+        c.execute("UPDATE points SET eval_pt=0, carry_pt=?, save_pt=? WHERE user_id=?",
+                  (carry_pt, save_pt, user_id))
+        c.execute("UPDATE users SET missed_count=? WHERE user_id=?", (missed_count, user_id))
+
+        report_lines.append(f"<@{user_id}> : 未達連続 {missed_count} 回, 繰越 Pt {carry_pt}")
+
+    conn.commit()
+
+    # 結果を返信
+    await interaction.response.send_message(
+        "月次決算処理完了\n" + "\n".join(report_lines)
+    )
+
     client.run(TOKEN)
